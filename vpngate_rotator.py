@@ -7,6 +7,7 @@ from io import StringIO
 import base64
 import csv
 import re
+import subprocess
 import traceback
 import logging
 import socket
@@ -117,11 +118,11 @@ class VpnGateRotator:
         return random_data
 
     def connect_new(self, country = "", speed = "", ping = ""):
-        return self.loop.run_until_complete(self._connect_new(country, speed, ping, process_timeout=5))
+        return self.loop.run_until_complete(self._connect_new(country, speed, ping, process_timeout=10))
     
-    async def _connect_new(self, country = "", speed = "", ping = "", process_timeout = 5):
-        timeout  = 15
-        retry_life = 3
+    async def _connect_new(self, country = "", speed = "", ping = "", process_timeout = 10):
+        timeout  = 20
+        retry_life = 30
         args = ("openvpn", "/tmp/openvpnconf")
         while retry_life:
             try:
@@ -136,20 +137,30 @@ class VpnGateRotator:
                 start_time = time.time()
                 while True:
                     output = (await asyncio.wait_for(process.stdout.readline(), process_timeout)).decode().rstrip("\n")
-                    if output == '' and process.poll() is not None:
+                    
+                    if output == '' and process.returncode is not None:
                         Logger.error(f'open vpn exited')
                         break
+                    
                     if 'Initialization Sequence Completed' in output:
                         Logger.info(f'Connected')
                         return 0
+                    
                     if "error" in output:
                         Logger.error(output)
+                        
+                    if "Linux route add command failed" in output:
                         break
+                    
                     if time.time() - start_time > timeout:
-                        raise(f'open vpn timed out')
-                output, error = process.communicate()
-                if error:
-                    raise(f'Error: {error.decode()}')
+                        Logger.error(f'open vpn timed out')
+                        break
+                    
+            except (asyncio.exceptions.TimeoutError):
+                Logger.error("open vpn timed out")
+                self.disconnect()
+                retry_life -= 1
+                
             except Exception as e:
                 Logger.error(str(e))
                 traceback.print_exc()
