@@ -7,12 +7,14 @@ from io import StringIO
 import base64
 import csv
 import re
-import subprocess
 import traceback
 import logging
 import socket
 from urllib import request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import asyncio
+from asyncio.subprocess import PIPE, STDOUT
 
 class Logger:
     logger = logging.getLogger(__name__)
@@ -64,6 +66,7 @@ class VpnGateRotator:
             self.MESSAGE, self.OPENVPN_CONFIG_DATA
         ]
         self.servers = self.get_server_list()
+        self.loop = asyncio.get_event_loop()
 
     def get_server_list(self) -> list:
         Logger.info("Getting server list")
@@ -114,28 +117,44 @@ class VpnGateRotator:
         return random_data
 
     def connect_new(self, country = "", speed = "", ping = ""):
-        selected_server = self.select_server(country, speed, ping)
-        if selected_server is None:
-            raise("No VPN found")
-        self.disconnect()
-        with(open("/tmp/openvpnconf", "w")) as f:
-            f.write(selected_server[self.OPENVPN_CONFIG_DATA])
-        Logger.info(f'Connecting to {selected_server[self.HOST_NAME]} {selected_server[self.IP]} {selected_server[self.COUNTRY_SHORT]} {int(selected_server[self.SPEED])/1024/1024}Mbps {selected_server[self.PING]}ms')
-        process = subprocess.Popen(["openvpn", "/tmp/openvpnconf"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        while True:
-            output = process.stdout.readline().decode().rstrip("\n")   #"\n".join([line.decode().rstrip("\n") for line in process.stdout.readlines()])
-            if output == '' and process.poll() is not None:
-                Logger.error(f'open vpn exited')
-                break
-            if 'Initialization Sequence Completed' in output:
-                Logger.info(f'Connected')
-                return 0
-            if "error" in output:
-                Logger.error(output)
-                break
-        output, error = process.communicate()
-        if error:
-            raise(f'Error: {error.decode()}')
+        return self.loop.run_until_complete(self._connect_new(country, speed, ping, process_timeout=5))
+    
+    async def _connect_new(self, country = "", speed = "", ping = "", process_timeout = 5):
+        timeout  = 15
+        retry_life = 3
+        args = ("openvpn", "/tmp/openvpnconf")
+        while retry_life:
+            try:
+                selected_server = self.select_server(country, speed, ping)
+                if selected_server is None:
+                    raise("No VPN found")
+                self.disconnect()
+                with(open("/tmp/openvpnconf", "w")) as f:
+                    f.write(selected_server[self.OPENVPN_CONFIG_DATA])
+                Logger.info(f'Connecting to {selected_server[self.HOST_NAME]} {selected_server[self.IP]} {selected_server[self.COUNTRY_SHORT]} {int(selected_server[self.SPEED])/1024/1024}Mbps {selected_server[self.PING]}ms')
+                process = await asyncio.create_subprocess_exec(*args, stdout=PIPE, stderr=STDOUT)
+                start_time = time.time()
+                while True:
+                    output = (await asyncio.wait_for(process.stdout.readline(), process_timeout)).decode().rstrip("\n")
+                    if output == '' and process.poll() is not None:
+                        Logger.error(f'open vpn exited')
+                        break
+                    if 'Initialization Sequence Completed' in output:
+                        Logger.info(f'Connected')
+                        return 0
+                    if "error" in output:
+                        Logger.error(output)
+                        break
+                    if time.time() - start_time > timeout:
+                        raise(f'open vpn timed out')
+                output, error = process.communicate()
+                if error:
+                    raise(f'Error: {error.decode()}')
+            except Exception as e:
+                Logger.error(str(e))
+                traceback.print_exc()
+                self.disconnect()
+                retry_life -= 1
     
     def disconnect(self):
         call(["killall", "-9", "openvpn"])
