@@ -2,15 +2,13 @@ from os import geteuid, remove
 from os.path import isfile
 import random
 from subprocess import call
-from sys import argv, exit
+from sys import exit
 from io import StringIO
 import base64
 import csv
 import re
-import sys
 import subprocess
 import traceback
-import asyncio, aiohttp
 import logging
 import socket
 from urllib import request
