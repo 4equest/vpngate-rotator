@@ -4,7 +4,7 @@ WIP
 ```python
 import vpngate_rotator
 
-vpn = VpnGateRotator()
+vpn = vpngate_rotator.VpnGateRotator()
 vpn.connect_new()
 
 ```
