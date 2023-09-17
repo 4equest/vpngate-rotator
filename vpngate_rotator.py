@@ -12,7 +12,9 @@ import subprocess
 import traceback
 import asyncio, aiohttp
 import logging
-
+import socket
+from urllib import request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class Logger:
     logger = logging.getLogger(__name__)
@@ -38,7 +40,9 @@ class Logger:
         
 class VpnGateRotator:
     def __init__(self):
-        self.servers = list()
+        if geteuid() != 0:
+            Logger.error("Run as super user!")
+            exit(1)
         self.HOST_NAME = "HostName"
         self.IP = "IP"
         self.SCORE = "Score"
@@ -61,47 +65,38 @@ class VpnGateRotator:
             self.UPTIME, self.TOTAL_USERS, self.TOTAL_TRAFFIC, self.LOG_TYPE, self.OPERATOR,
             self.MESSAGE, self.OPENVPN_CONFIG_DATA
         ]
-        asyncio.run(self.get_server_list())
+        self.servers = self.get_server_list()
 
-    async def get_server_list(self):
+    def get_server_list(self) -> list:
         Logger.info("Getting server list")
-        async with aiohttp.ClientSession() as session:
-            async with session.get("http://www.vpngate.net/api/iphone/") as res:
-                csv_data = await res.text()
-                with StringIO(csv_data) as f:
-                    csv_reader = csv.DictReader(f, self.CSV_HEADER)
+        req = request.Request("http://www.vpngate.net/api/iphone/")
+        with request.urlopen(req) as res:
+            with StringIO(res.read().decode()) as f:
+                csv_reader = csv.DictReader(f, self.CSV_HEADER)
+                next(csv_reader)
+                next(csv_reader)
+                Logger.info("Checking servers")
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = [executor.submit(self.check_config, row) for row in csv_reader if (row[self.HOST_NAME] != "*") and (len(row) == 15)]
+                    rows = [future.result() for future in as_completed(futures) if future.result() is not None]
+        return rows
 
-                    next(csv_reader)
-                    next(csv_reader)
-
-                    tasks = []
-                    rows = []
-                    Logger.info("Checking servers")
-                    for row in csv_reader:
-                        if (row[self.HOST_NAME] != "*") & (len(row) == 15):
-                            tasks.append(self.check_config(rows, row))
-                    await asyncio.gather(*tasks)
-
-                    self.servers = rows
-                    
-    async def check_config(self, rows, row):
+    def check_config(self, row):
         try:
             config = base64.b64decode(row[self.OPENVPN_CONFIG_DATA]).decode()
-            ip, port = re.findall("remote (.*) (.*)\r", config)[1]
-            proto = re.findall("proto (.*)\r", config)[1]
+            ip, port = re.findall("remote (.*) (.*)\r", config)[0]
+            proto = re.findall("proto (.*)\r", config)[0]
 
-            if "tcp" == str(proto):
-                reader, writer = await asyncio.open_connection(ip, int(port))
-                writer.close()
-                await writer.wait_closed()
-            
+            if proto == "tcp":
+                with socket.create_connection((ip, int(port)), timeout=3):
+                    pass
+
             row[self.OPENVPN_CONFIG_DATA] = config
-            row[self.PROTOCOL] = proto
-            rows.append(row)
+            return row
 
-        except (IndexError, ConnectionRefusedError) as e:
-            Logger.error(str(e), file=sys.stderr)
-            Logger.error(str(ip) + ":" + str(port), file=sys.stderr)
+        except Exception as e:
+            Logger.error(f"{ip}:{port}:{e}")
+            return None
             
     def select_server(self, country = "", speed = "", ping = ""):
         filtered_data = []
@@ -120,7 +115,6 @@ class VpnGateRotator:
             
         return random_data
 
-        
     def connect_new(self, country = "", speed = "", ping = ""):
         selected_server = self.select_server(country, speed, ping)
         if selected_server is None:
@@ -128,23 +122,19 @@ class VpnGateRotator:
         self.disconnect()
         with(open("/tmp/openvpnconf", "w")) as f:
             f.write(selected_server[self.OPENVPN_CONFIG_DATA])
-            
-        process = subprocess.Popen(["openvpn", "--help", "/tmp/openvpnconf"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        Logger.info(f'Connecting to {selected_server[self.HOST_NAME]} {selected_server[self.IP]} {selected_server[self.COUNTRY_SHORT]} {int(selected_server[self.SPEED])/1024/1024}Mbps {selected_server[self.PING]}ms')
+        process = subprocess.Popen(["openvpn", "/tmp/openvpnconf"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         while True:
-            output = "\n".join([line.decode().rstrip("\n") for line in process.stdout.readlines()])
-            err = "\n".join([line.decode().rstrip("\n") for line in process.stderr.readlines()])
+            output = process.stdout.readline().decode().rstrip("\n")   #"\n".join([line.decode().rstrip("\n") for line in process.stdout.readlines()])
             if output == '' and process.poll() is not None:
-                Logger.error(f'open vpn exited \n {err}')
+                Logger.error(f'open vpn exited')
                 break
-            if 'Connected' in output:
-                Logger.info(f'Connected to {selected_server[self.HOST_NAME]} {selected_server[self.IP]} {selected_server[self.COUNTRY_SHORT]} {selected_server[self.SPEED]/1024/1024}Mbps {selected_server[self.PING]}ms')
+            if 'Initialization Sequence Completed' in output:
+                Logger.info(f'Connected')
                 return 0
-            if err:
-                Logger.error(err)
+            if "error" in output:
+                Logger.error(output)
                 break
-            if output:
-                print(output)
-        
         output, error = process.communicate()
         if error:
             raise(f'Error: {error.decode()}')
@@ -159,10 +149,6 @@ class VpnGateRotator:
             pass
 
 if __name__ == "__main__":
-    if geteuid() != 0:
-        Logger.error("Run as super user!")
-        exit(1)
-        
     vpn = VpnGateRotator()
     try:
         vpn.connect_new()
@@ -171,10 +157,11 @@ if __name__ == "__main__":
         ans = input("try another vpn? (y/n)")
         if ans.lower() in ("y", "yes"):
             try:
-                VpnGateRotator()
+                vpn.connect_new()
             except:
-                VpnGateRotator.clean_up()
+                vpn.disconnect()
+                vpn.clean_up()
     except Exception as e:
         Logger.error(e)
         traceback.print_exc()
-        VpnGateRotator.clean_up()
+        vpn.clean_up()
